@@ -125,7 +125,8 @@ async def run_account_worker(acc_info):
 
                 if poll.closed:
                     print(f"[{label}] Skipping closed poll in history: '{poll_text}'")
-                    continue
+                    # continue
+                    break
 
                 print(
                     f"[{label}] Found active historical poll: '{poll_text}' (Msg ID: {message.id})"
