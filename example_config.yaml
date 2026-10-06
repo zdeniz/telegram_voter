@@ -1,0 +1,28 @@
+# These example values won't work. You must get your own api_id and
+# api_hash from https://my.telegram.org, under API Development.
+# change the file name example_config.yaml to config.yaml
+
+target_channel: "Aspendos Tüm Bina"
+
+accounts:
+  - session: "user_session_1"
+    api_id: 1234567
+    api_hash: "hash_1"
+    rules:
+      - question_keyword: "Bir sonraki iş günü için:"
+        target_answers: 
+          - "Öğle yemeği istiyorum"
+          # - "Servis kullanacağım"
+      - default_fallback: false
+        fallback_indices: [0]
+
+  - session: "user_session_2"
+    api_id: 2345678
+    api_hash: "hash_2"
+    rules:
+      - question_keyword: "Bir sonraki iş günü için:"
+        target_answers: 
+          - "Öğle yemeği istiyorum"
+          # - "Servis kullanacağım"
+      - default_fallback: false
+        fallback_indices: [0]
