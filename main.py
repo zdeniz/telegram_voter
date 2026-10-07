@@ -1,184 +1,229 @@
 import asyncio
+import sys
+from datetime import datetime
+
+import yaml
 from telethon import TelegramClient, events
-from telethon.tl.functions.messages import SendVoteRequest
 from telethon.errors import FloodWaitError
+from telethon.tl.functions.messages import SendVoteRequest
 
-# These example values won't work. You must get your own api_id and
-# api_hash from https://my.telegram.org, under API Development.
-ACCOUNTS_CONFIG = [
-    {
-        "session": "user_session_1", 
-        "api_id": 1234567, 
-        "api_hash": "hash_1"
-    },
-]
 
-# Maps question keywords/patterns to target answer keywords or fallback indices
-POLL_RULES = [
-    {
-        "question_keyword": " Bir sonraki iş günü için:",
-        # Vote for these if available
-        "target_answers": [
-            "Öğle yemeği istiyorum"
-            # , "Servis kullanacağım"
-        ],
-        # Fallback to 1st option if keywords not found
-        "fallback_indices": [0],
-    },
-]
+def log(message: str) -> None:
+    """print() with a timestamp at the start of the line."""
+    if message.startswith("\n"):  # keep the blank separator line, put the timestamp on the text
+        print()
+        message = message.lstrip("\n")
+    print(f"{datetime.now():%Y-%m-%d %H:%M:%S} {message}", flush=True)
 
-# Can be a chat name from user history or a chat id int
-TARGET_CHANNEL = "Aspendos Tüm Bina"
+
+def load_config(file_path="config.yaml"):
+    """Loads YAML configuration using PyYAML."""
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        sys.exit(f"Error: Configuration file '{file_path}' not found.")
+
+
+CONFIG = load_config()
+TARGET_CHANNEL = CONFIG.get("target_channel")
+ACCOUNTS_CONFIG = CONFIG.get("accounts", [])
+HISTORY_LIMIT = 50  # how many recent messages to scan for the latest poll on startup
+
+
+def clean(text) -> str:
+    """For LOG OUTPUT ONLY: collapses every whitespace run (spaces, \r, \n, \t) into one space."""
+    return " ".join(str(text).split())
 
 
 def get_plain_text(obj) -> str:
-    """Safely extracts plain text string handling Telethon's TextWithEntities or standard str."""
+    """Handles Telethon's TextWithEntities as well as plain str. Strips leading/trailing whitespace."""
     if hasattr(obj, "text"):
-        return str(obj.text)
-    return str(obj)
+        return str(obj.text).strip()
+    return str(obj).strip()
 
 
-def select_vote_options(poll, answers):
-    """Matches poll question against rules dictionary and resolves target option bytes."""
-    question = get_plain_text(poll.question).lower()
-    matched_rule = None
+def select_vote_options(poll, rules):
+    """
+    Keyword rules are tried first (in config order), then the default_fallback rule.
+    """
+    question = get_plain_text(poll.question)
 
-    for rule in POLL_RULES:
-        if rule.get("default"):
-            matched_rule = rule
-            continue
-        if rule.get("question_keyword", "").lower() in question:
-            matched_rule = rule
-            break
+    candidates = []
+    default_rule = None
+    for rule in rules:
+        keyword = str(rule.get("question_keyword") or "").strip()
+        if keyword:
+            if keyword in question:
+                candidates.append(rule)
+        elif rule.get("default_fallback") and default_rule is None:
+            default_rule = rule
+    if default_rule:
+        candidates.append(default_rule)
 
-    target_bytes = []
+    for rule in candidates:
+        chosen = []
 
-    # Match by target answer text keywords
-    if matched_rule.get("target_answers"):
-        for answer in answers:
-            ans_text = get_plain_text(answer.text).lower()
-            if any(kw.lower() in ans_text for kw in matched_rule["target_answers"]):
-                target_bytes.append(answer.option)
-                if not poll.multiple_choice:
-                    break
+        targets = [str(t).strip() for t in (rule.get("target_answers") or [])]
+        if targets:
+            for answer in poll.answers:
+                if get_plain_text(answer.text) in targets:
+                    chosen.append(answer.option)
+                    if not poll.multiple_choice:
+                        break
 
-    # Fallback to specific indices if no keyword matched, disabled for now
-    # if not target_bytes and matched_rule.get("fallback_indices"):
-    #     for idx in matched_rule["fallback_indices"]:
-    #         if idx < len(answers):
-    #             target_bytes.append(answers[idx].option)
+        if not chosen:
+            for idx in rule.get("fallback_indices") or []:
+                if 0 <= idx < len(poll.answers):
+                    chosen.append(poll.answers[idx].option)
+                    if not poll.multiple_choice:
+                        break
 
-    return target_bytes
+        if chosen:
+            return chosen
+
+    return []
 
 
-async def cast_vote(client, peer, message_id, poll, answers, account_label):
-    """Calculates choices and sends SendVoteRequest with error handling."""
-    options = select_vote_options(poll, answers)
-    if not options:
-        print(f"[{account_label}] No valid options resolved for poll.")
+def current_choices(message) -> list:
+    """Option bytes this account has currently voted for (empty list = not voted)."""
+    results = getattr(message.media, "results", None)
+    rows = getattr(results, "results", None) or []
+    return [r.option for r in rows if getattr(r, "chosen", False)]
+
+
+async def cast_vote(client, chat, message, label, rules, voted_ids):
+    poll = message.media.poll
+    poll_text = clean(get_plain_text(poll.question))  # used in log lines only
+
+    # Closed poll: nothing can be done.
+    if poll.closed:
+        log(f"[{label}] Poll is closed, skipping: '{poll_text}'")
         return
 
-    try:
-        await client(SendVoteRequest(peer=peer, msg_id=message_id, options=options))
-        print(f"[{account_label}] Successfully voted with options: {options}")
-    except FloodWaitError as e:
-        print(f"[{account_label}] Rate limited. Must wait {e.seconds} seconds.")
-    except Exception as e:
-        print(f"[{account_label}] Failed to vote: {e}")
+    # Already handled in this session (e.g. startup scan vs. live handler).
+    if message.id in voted_ids:
+        return
+
+    options = select_vote_options(poll, rules)
+    if not options:
+        shown = [clean(get_plain_text(a.text)) for a in poll.answers]
+        log(f"[{label}] No rule matched poll '{poll_text}'. Answers were: {shown}")
+        return
+
+    previous = current_choices(message)
+    if previous:
+        # Already voted: change the vote only if it differs from what the rules want.
+        if set(previous) == set(options):
+            log(f"[{label}] Already voted as per rules on poll {message.id}, nothing to change.")
+            voted_ids.add(message.id)
+            return
+        if poll.quiz or getattr(poll, "revoting_disabled", False):
+            log(f"[{label}] Poll {message.id} does not allow changing votes, skipping.")
+            voted_ids.add(message.id)
+            return
+        log(f"[{label}] Changing vote on poll {message.id}: {previous} -> {options}")
+        action = "Changed vote"
+    else:
+        action = "Voted"
+
+    voted_ids.add(
+        message.id
+    )  # claim it first so the startup check and the live handler can't double-vote
+    for attempt in range(2):
+        try:
+            await client(SendVoteRequest(peer=chat, msg_id=message.id, options=options))
+            log(f"[{label}] {action} on '{poll_text}' with options: {options}")
+            return
+        except FloodWaitError as e:
+            log(f"[{label}] Rate limited, waiting {e.seconds}s...")
+            await asyncio.sleep(e.seconds + 1)
+        except Exception as e:
+            log(f"[{label}] Failed to vote: {e}")
+            voted_ids.discard(message.id)
+            return
+    voted_ids.discard(message.id)
 
 
 async def resolve_chat_entity(client, chat_target):
-    """Resolves chat target whether provided as int ID or string display name."""
+    """Resolves an int ID, a dialog display name, a @username or an invite link."""
     if isinstance(chat_target, int):
         return await client.get_entity(chat_target)
 
-    # Match string display name against active dialogs
     async for dialog in client.iter_dialogs():
-        if dialog.name == chat_target or dialog.title == chat_target:
+        if dialog.name == chat_target:
             return dialog.entity
 
-    # Fallback resolver for @usernames or invite links
     return await client.get_entity(chat_target)
 
 
-async def run_account_worker(acc_info):
+async def run_account_worker(client, acc_info):
     label = acc_info["session"]
-    client = TelegramClient(
-        acc_info["session"], acc_info["api_id"], acc_info["api_hash"]
-    )
-
-    await client.start()
-    print(f"[{label}] Account connected.")
+    rules = acc_info.get("rules", [])
+    voted_ids = set()
 
     try:
-        # Step 0: Resolve Target Chat
         chat = await resolve_chat_entity(client, TARGET_CHANNEL)
-        chat_title = getattr(chat, "title", str(chat.id))
-        print(f"[{label}] Resolved chat: '{chat_title}' (ID: {chat.id})")
+        chat_title = clean(getattr(chat, "title", None) or chat.id)
+        log(f"[{label}] Resolved chat: '{chat_title}' (ID: {chat.id})")
 
-        # Step 1 & 2: Check history for latest unclosed poll and vote
-        print(f"[{label}] Checking recent history for active polls...")
-        async for message in client.iter_messages(chat, limit=50):
-            if message.media and hasattr(message.media, "poll"):
-                poll = message.media.poll
-                poll_text = get_plain_text(poll.question)
-
-                if poll.closed:
-                    print(f"[{label}] Skipping closed poll in history: '{poll_text}'")
-                    # continue
-                    break
-
-                print(
-                    f"[{label}] Found active historical poll: '{poll_text}' (Msg ID: {message.id})"
-                )
-                await cast_vote(
-                    client=client,
-                    peer=chat,
-                    message_id=message.id,
-                    poll=poll,
-                    answers=poll.answers,
-                    account_label=label,
-                )
-                break  # Process only the latest open poll from history
-
-        # Step 3: Attach event listener to listen for new polls forever
+        # Register the live handler first so nothing is missed during the startup check.
         @client.on(events.NewMessage(chats=chat))
         async def on_new_message(event):
-            if event.message.media and hasattr(event.message.media, "poll"):
-                poll = event.message.media.poll
-                poll_text = get_plain_text(poll.question)
-
-                if poll.closed:
-                    return
-
-                print(
-                    f"\n[{label}] New Live Poll Detected: '{poll_text}' (Msg ID: {event.message.id})"
+            media = event.message.media
+            if media and hasattr(media, "poll"):
+                log(
+                    f"\n[{label}] New poll: '{clean(get_plain_text(media.poll.question))}' "
+                    f"(Msg ID: {event.message.id})"
                 )
-                await cast_vote(
-                    client=client,
-                    peer=event.chat_id,
-                    message_id=event.message.id,
-                    poll=poll,
-                    answers=poll.answers,
-                    account_label=label,
-                )
+                await cast_vote(client, chat, event.message, label, rules, voted_ids)
 
-        print(
-            f"[{label}] Now listening to '{chat_title}' continuously for future polls...\n"
+        # Look back through recent history for the most recent poll (newest first).
+        log(
+            f"[{label}] Searching the last {HISTORY_LIMIT} messages for the latest poll..."
         )
+        found_poll = False
+        async for message in client.iter_messages(chat, limit=HISTORY_LIMIT):
+            if message.media and hasattr(message.media, "poll"):
+                found_poll = True
+                log(
+                    f"[{label}] Latest poll is Msg ID {message.id}: "
+                    f"'{clean(get_plain_text(message.media.poll.question))}'"
+                )
+                await cast_vote(client, chat, message, label, rules, voted_ids)
+                break  # only the most recent poll; if it's closed, cast_vote just reports it
+        if not found_poll:
+            log(f"[{label}] No poll found in the last {HISTORY_LIMIT} messages.")
+
+        log(f"[{label}] Listening to '{chat_title}' for upcoming polls...\n")
         await client.run_until_disconnected()
 
     except Exception as e:
-        print(f"[{label}] Worker execution error: {e}")
+        log(f"[{label}] Worker execution error: {e}")
     finally:
         if client.is_connected():
             await client.disconnect()
 
 
 async def main():
-    tasks = [run_account_worker(acc) for acc in ACCOUNTS_CONFIG]
-    await asyncio.gather(*tasks)
+    if not ACCOUNTS_CONFIG:
+        log("No accounts defined in configuration file.")
+        return
+
+    # Log in sequentially: client.start() may prompt for phone/code on stdin,
+    # and concurrent prompts from several accounts would collide.
+    logged_in = []
+    for acc in ACCOUNTS_CONFIG:
+        client = TelegramClient(acc["session"], acc["api_id"], acc["api_hash"])
+        await client.start()  # type: ignore[misc]  # Telethon's typing is wrong here; it is awaitable in async code
+        log(f"[{acc['session']}] Account connected.")
+        logged_in.append((client, acc))
+
+    await asyncio.gather(*(run_account_worker(c, a) for c, a in logged_in))
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
